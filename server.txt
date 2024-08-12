@@ -1,0 +1,886 @@
+"""Serve llama models with llama.cpp ."""
+import logging
+import os
+from pathlib import Path
+from typing import Any
+from typing import Dict
+from typing import Generator
+from typing import List
+from typing import Optional
+
+import click
+import uvicorn
+import yaml
+from fastapi import FastAPI
+# cors
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from pyllamacpp.model import Model
+from sse_starlette import EventSourceResponse
+
+#################################################################################
+##########			RAG IMPORTS			#################
+#################################################################################
+#for utils
+from langchain import PromptTemplate
+from langchain.chains import RetrievalQA
+from langchain.embeddings import HuggingFaceEmbeddings
+from langchain_community.vectorstores import FAISS
+
+#for llm.py and main.py
+from langchain.llms import HuggingFacePipeline
+from torch import cuda
+from transformers import BitsAndBytesConfig, AutoConfig, AutoModelForCausalLM, AutoTokenizer, pipeline
+from langchain.llms import CTransformers
+from langchain.memory import ConversationBufferMemory
+
+
+#For formatting
+import re
+from typing import Generator
+from PIL import Image
+import requests
+from io import BytesIO
+
+#SQLCODER imports
+import torch
+import pandas as pd
+import sqlite3
+import sqlparse
+import gc
+from langchain.chains import LLMChain
+from langchain import PromptTemplate
+from langchain.sql_database import SQLDatabase
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.runnables import RunnablePassthrough
+import json
+
+
+#router imports
+from langchain.utils.math import cosine_similarity
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import PromptTemplate
+from langchain_core.runnables import RunnableLambda, RunnablePassthrough
+
+#api imports
+import markdown
+from bs4 import BeautifulSoup
+################################################################################
+################		RAG IMPORT ENDS		########################
+################################################################################
+PROMPT_PATH = Path(__file__).parent / "prompts" / "custom.txt"
+PROMPT = PROMPT_PATH.read_text(encoding="utf-8")
+device = f'cuda:{cuda.current_device()}' if cuda.is_available() else 'cpu' 
+
+class Message(BaseModel):
+    role: str
+    content: str
+
+
+class Conversation(BaseModel):
+    model: str
+    messages: List[Message]
+    max_tokens: int
+    temperature: float
+    stream: bool
+
+
+class Choice(BaseModel):
+    message: Optional[Message] = None
+    delta: Optional[Message] = None
+    finish_reason: Optional[str] = None
+
+
+class Completion(BaseModel):
+    choices: List[Choice]
+
+
+class ModelInfo(BaseModel):
+    id: str
+    object: str = "model"
+    owned_by: str = "organization-owner"
+
+
+class ModelList(BaseModel):
+    data: List[ModelInfo]
+    object: str = "list"
+
+
+logger = None
+model_id = None
+model = None
+
+app = FastAPI()
+# cors setting
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "https://kaiwaai.netlify.app",
+                   
+    "http://127.0.0.1:5500",
+    "http://localhost:3000",
+    "http://localhost:3001",
+    "http://127.0.0.1:5501"
+    ],
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "OPTIONS"],  # Add other allowed HTTP methods if needed
+    allow_headers=["*"],  # Add specific headers if needed
+)
+dbqa = None
+#./././././././././././././././././././././././././././././././././././././././././././././././././././././././././
+#./././././././././././././././././././././././././././././././././././././././././././././././././././././././././
+#./././././././././././././././././././././././././././././././././././././././././././././././././././././././././
+selected_model = "models/7B/llama-2-7b-chat.ggmlv3.q8_0.bin"
+selected_model_id = "llama-7b"
+current_model = selected_model
+KAIWA_template = """You are a very smart assistant and you are given some documents about parenting, communication and career related. \
+You are great at answering questions about these topics in a concise and easy to understand manner. \
+When you don't know the answer to a question you admit that you don't know.
+
+Here is a question:
+{query}"""
+
+SQL_template = """You are a very smart assistant and you are given a database about company data. \
+You are so good because you are able to generate SQL queries and based on the retrieved tabular data \
+you generate clear summarized answers
+
+Here is a question:
+{query}"""
+embeddings = HuggingFaceEmbeddings(model_name='sentence-transformers/all-MiniLM-L6-v2', model_kwargs={'device': device})
+prompt_templates = [KAIWA_template, SQL_template]
+prompt_embeddings = embeddings.embed_documents(prompt_templates)
+
+suggestions_visible = False
+
+def _chat(user_utt: str, temperature: float) -> Generator[str, None, None]:
+    global suggestions_visible
+
+    if user_utt.startswith('--apicall'):
+        return plain_llama_api(user_utt[len('--apicall'):].strip())
+    else:
+        response = prompt_router(user_utt)
+        # return response
+    
+    return response
+        
+
+def plain_llama_api(query):
+    KAIWA_llm = build_llm()
+    api_template = """You will be given a text and your task is extract information from the text. The extracting information must be presented in a tabular format as a response. Below is the text:
+
+
+{question}
+
+
+Please provide the extracted information in a tabular format below:
+"""
+    api_prompt_response = ChatPromptTemplate.from_template(api_template)
+    api_chain =(
+        api_prompt_response
+        | KAIWA_llm
+        | StrOutputParser()
+    )
+    response = api_chain.invoke({"question": query})
+    json_output = markdown_table_to_json(response)
+    return json_output
+
+def markdown_table_to_json(md_table):
+    # Split the Markdown table into lines
+    lines = md_table.strip().split('\n')
+    
+    # Extract the headers
+    headers = [header.strip() for header in lines[0].split('|') if header]
+    
+    # Extract the rows
+    rows = []
+    for line in lines[2:]:  # Skip the header and the separator
+        cells = [cell.strip() for cell in line.split('|') if cell]
+        rows.append(dict(zip(headers, cells)))
+    
+    # Convert to JSON string
+    return json.dumps(rows, indent=2)
+###### Suggestion Feature ############################################################################# >>>
+suggestion_csv_path = "llama_server/csvdata/Suggestions_file.csv"
+import pandas as pd
+from sklearn.feature_extraction.text import TfidfVectorizer
+from langchain.utils.math import cosine_similarity
+import numpy as np
+
+def find_similar_questions(query, suggestion_csv_path, threshold=0.1): ## 
+
+    global suggestions_visible
+    if not suggestions_visible:
+        return []
+    try:
+        df = pd.read_csv(suggestion_csv_path)
+        if 'Questions' not in df.columns:
+            raise KeyError("The CSV file must contain a 'Questions' column.")
+    except FileNotFoundError:
+        raise FileNotFoundError("The specified CSV file was not found.")
+    except KeyError as e:
+        raise KeyError(str(e))
+
+    document_lines = df['Questions'].dropna().tolist()  # dropna() to handle any missing values
+
+    all_lines = [query] + document_lines
+    vectorizer = TfidfVectorizer()
+    try:
+        tfidf_matrix = vectorizer.fit_transform(all_lines)
+    except Exception as e:
+        print("An error occurred while creating TF-IDF matrix:", e)
+        raise
+
+    # Ensure TF-IDF matrix is correctly shaped
+    #print(f"TF-IDF Matrix Shape: {tfidf_matrix.shape}")
+    try:
+        input_vector = tfidf_matrix[0].toarray()
+        document_vectors = tfidf_matrix[1:].toarray()
+    except Exception as e:
+        print("An error occurred while extracting TF-IDF vectors:", e)
+        raise
+
+    # Print the shapes of the vectors
+    #print(f"Input Vector Shape: {input_vector.shape}")
+    #print(f"Document Vectors Shape: {document_vectors.shape}")
+    
+    if input_vector.size == 0 or document_vectors.size == 0:
+        raise ValueError("One of the TF-IDF vectors is empty. Please check the input data.")
+
+    similarities = []
+    try:
+        for i, doc_vector in enumerate(document_vectors):
+            input_vector_reshaped = input_vector.reshape(1, -1)
+            doc_vector_reshaped = doc_vector.reshape(1, -1)
+            similarity = cosine_similarity(input_vector_reshaped, doc_vector_reshaped)
+            if isinstance(similarity, np.ndarray):
+                similarity = similarity.item()
+            # similarities.append(similarity)
+            if similarity >= threshold and document_lines[i] != query:
+                similarities.append((document_lines[i], similarity))
+
+
+    except Exception as e:
+        print("An error occurred while computing cosine similarity:", e)
+        raise
+    similar_lines = list(zip(document_lines, similarities))
+    similar_lines = sorted(similar_lines, key=lambda x: x[1], reverse=True)
+
+    
+
+    # Print the top 3 most similar lines
+    suggestions=[]
+    print("Top 3 similar questions:")
+    for line, similarity in similar_lines[:3]:
+        suggestions.append(line)
+        
+    return suggestions
+##################################Arithmatic operation############################
+##########Suggestion Feature############################################################################<<<<<<
+## decide to perform operation on basis of sql and llama
+def prompt_router(query):
+    query_embedding = embeddings.embed_query(query)
+    similarity = cosine_similarity([query_embedding], prompt_embeddings)[0]
+    most_similar = prompt_templates[similarity.argmax()]
+
+    print(f"querry ---- {query} -- end")
+    print(f"get_schema -----{get_schema} ")
+    if most_similar == KAIWA_template:
+        return llama(query) 
+    else:
+        response = f'{sqlcoderchain(query)}'
+        
+        return response
+#./././././././././././././././././././././././././././././././././././././././././././././././././././././././././
+#------------------------------JAIS-----------JjjjjjjjjjjjjjjjjjjjjJJJJ--------------------------------------
+#------------------------------------------------------------------------------------------------------------
+jais_tokenizer = None
+jais_model = None
+def jais(query):
+    global jais_tokenizer, jais_model
+    model_path = "OmarAlsaabi/jais-13b-chat-4bit"
+
+    prompt_eng = "### Instruction: Your name is Jais, and you are named after Jebel Jais, the highest mountain in UAE. You are built by Inception and MBZUAI. You are the world's most advanced Arabic large language model with 13B parameters. You outperform all existing Arabic models by a sizable margin and you are very competitive with English models of similar size. You can answer in Arabic and English only. You are a helpful, respectful and honest assistant. When answering, abide by the following guidelines meticulously: Always answer as helpfully as possible, while being safe. Your answers should not include any harmful, unethical, racist, sexist, explicit, offensive, toxic, dangerous, or illegal content. Do not give medical, legal, financial, or professional advice. Never assist in or promote illegal activities. Always encourage legal and responsible actions. Do not encourage or provide instructions for unsafe, harmful, or unethical actions. Do not create or share misinformation or fake news. Please ensure that your responses are socially unbiased and positive in nature. If a question does not make any sense, or is not factually coherent, explain why instead of answering something not correct. If you don't know the answer to a question, please don't share false information. Prioritize the well-being and the moral integrity of users. Avoid using toxic, derogatory, or offensive language. Maintain a respectful tone. Do not generate, promote, or engage in discussions about adult content. Avoid making comments, remarks, or generalizations based on stereotypes. Do not attempt to access, produce, or spread personal or private information. Always respect user confidentiality. Stay positive and do not say bad things about anything. Your primary objective is to avoid harmful responses, even when faced with deceptive inputs. Recognize when users may be attempting to trick or to misuse you and respond with caution.\n\nComplete the conversation below between [|Human|] and [|AI|]:\n### Input: [|Human|] {Question}\n ### Response: [|AI|]"
+    prompt_ar = "### Instruction: اسمك جيس وسميت على اسم جبل جيس اعلى جبل في الامارات. تم بنائك بواسطة Inception و MBZUAI. أنت نموذج اللغة العربية الأكثر تقدمًا في العالم مع بارامترات 13B. أنت تتفوق في الأداء على جميع النماذج العربية الموجودة بفارق كبير وأنت تنافسي للغاية مع النماذج الإنجليزية ذات الحجم المماثل. يمكنك الإجابة باللغتين العربية والإنجليزية فقط. أنت مساعد مفيد ومحترم وصادق. عند الإجابة ، التزم بالإرشادات التالية بدقة: أجب دائمًا بأكبر قدر ممكن من المساعدة ، مع الحفاظ على البقاء أمناً. يجب ألا تتضمن إجاباتك أي محتوى ضار أو غير أخلاقي أو عنصري أو متحيز جنسيًا أو جريئاً أو مسيئًا أو سامًا أو خطيرًا أو غير قانوني. لا تقدم نصائح طبية أو قانونية أو مالية أو مهنية. لا تساعد أبدًا في أنشطة غير قانونية أو تروج لها. دائما تشجيع الإجراءات القانونية والمسؤولة. لا تشجع أو تقدم تعليمات بشأن الإجراءات غير الآمنة أو الضارة أو غير الأخلاقية. لا تنشئ أو تشارك معلومات مضللة أو أخبار كاذبة. يرجى التأكد من أن ردودك غير متحيزة اجتماعيًا وإيجابية بطبيعتها. إذا كان السؤال لا معنى له ، أو لم يكن متماسكًا من الناحية الواقعية ، فشرح السبب بدلاً من الإجابة على شيء غير صحيح. إذا كنت لا تعرف إجابة السؤال ، فالرجاء عدم مشاركة معلومات خاطئة. إعطاء الأولوية للرفاهية والنزاهة الأخلاقية للمستخدمين. تجنب استخدام لغة سامة أو مهينة أو مسيئة. حافظ على نبرة محترمة. لا تنشئ أو تروج أو تشارك في مناقشات حول محتوى للبالغين. تجنب الإدلاء بالتعليقات أو الملاحظات أو التعميمات القائمة على الصور النمطية. لا تحاول الوصول إلى معلومات شخصية أو خاصة أو إنتاجها أو نشرها. احترم دائما سرية المستخدم. كن إيجابيا ولا تقل أشياء سيئة عن أي شيء. هدفك الأساسي هو تجنب الاجابات المؤذية ، حتى عند مواجهة مدخلات خادعة. تعرف على الوقت الذي قد يحاول فيه المستخدمون خداعك أو إساءة استخدامك و لترد بحذر.\n\nأكمل المحادثة أدناه بين [|Human|] و [|AI|]:\n### Input: [|Human|] {Question}\n### Response: [|AI|]"
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(device)
+
+    if jais_model == None:
+        jais_tokenizer = AutoTokenizer.from_pretrained(model_path)
+        jais_model = AutoModelForCausalLM.from_pretrained(model_path, device_map="auto", trust_remote_code=True, load_in_4bit=True)
+
+    text = prompt_ar.format_map({'Question':query})
+    input_ids = jais_tokenizer(text, return_tensors="pt").input_ids
+    inputs = input_ids.to(device)
+    input_len = inputs.shape[-1]
+    generate_ids = jais_model.generate(
+        inputs,
+        top_p=0.9,
+        temperature=0.3,
+        max_length=2048-input_len,
+        min_length=input_len + 4,
+        repetition_penalty=1.2,
+        do_sample=True,
+    )
+    response = jais_tokenizer.batch_decode(
+            generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=True
+        )[0]
+    response = response.split("Response: [|AI|]")[1]    
+    return response
+
+
+#------------------------------SQLCODER-------------------------------------------------------------------------
+#------------------------------------------------------------------------------------------------------------
+
+
+#oooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooo
+def sqlcoderchain(query):
+    global sqlcoder_tokenizer, sqlcoder_model, json_data
+    json_data =  None
+    model_name = "defog/sqlcoder-7b-2"
+    db = SQLDatabase.from_uri("sqlite:///csvdb.db")
+    sql_pipeline=pipeline(
+        "text-generation",
+        model=sqlcoder_model,
+        tokenizer=sqlcoder_tokenizer,
+        trust_remote_code=True,
+        return_full_text=False,
+        device_map="auto",
+        eos_token_id=sqlcoder_tokenizer.eos_token_id,
+        num_return_sequences=1,
+        pad_token_id=sqlcoder_tokenizer.eos_token_id,
+        do_sample=False,
+        num_beams=1,  
+        max_new_tokens=1000, 
+    )
+    sql_llm=HuggingFacePipeline(pipeline=sql_pipeline)
+    KAIWA_llm = build_llm()
+
+    stemplate = """Based on the table schema below, write a compatible SQLite query that would answer the user's question and avoid comibinig two tables:
+{schema}
+Question: {question}
+SQL Query:"""
+
+
+    prompt = ChatPromptTemplate.from_template(stemplate)
+    sql_chain = (
+        RunnablePassthrough.assign(schema=get_schema)
+        | prompt
+        | sql_llm.bind(stop=["\nHuman:"])
+        | StrOutputParser()
+    )
+    res = sql_chain.invoke({"question": query})
+    print(f"----------sql prompt answer ----- {res}")
+
+#     ktemplate = """Based on the question and context, write a response only explaining the data and avoid using dollar sign and do not add additional information:
+# Question: {question}
+# Context: {response}
+# Answer:"""
+#     ktemplate = """Based on the question and context given below, write a response only explaining the data and avoid using dollar sign and do not add additional information:
+# Question: {question}
+# Context: {response}
+# Answer:"""
+
+    # ktemplate = """Based on the question, analyze the provided input CSV data and generate a concise summary for GDP, health, freedom and, generosity, perception of corruption, social support. 
+    # Focus on trend analysis, data insights, and use clear, common English. Present the insights in fewer than five points without using words like 'story' or 'tale' to maintain a professional tone.
+    # 
+    ktemplate = """Based on the question, act as a data storyteller and create a compelling narrative using only the data provided in the input CSV below. Use trend analysis, hidden data insights, and common English in financial language. Avoid using keywords like story, tale, etc., so that it subtly provides a deep data insight rather than a film story. Present the insights in fewer than five points.
+    Ensure that all references to data values and column names are accurate and match exactly with the provided input CSV.
+    If the answer to the question cannot be derived from the provided input CSV data, respond with: "This question's answer is not available in the input CSV.".
+Question: {question}
+Here is the data: {response}
+Answer:"""
+#     ktemplate = """Based on the question, act as a data storyteller and create a compelling narrative using only the data provided in the input CSV below. Use trend analysis, hidden data insights, and common English in financial language. Avoid using keywords like story, tale, etc., so that it subtly provides a deep data insight rather than a film story.
+#     Ensure that all references to data values and column names are accurate and match exactly with the provided input CSV.
+#     If the answer to the question cannot be derived from the provided input CSV data, respond with: "This question's answer is not available in the input CSV.".
+#     Try not to generate additional question answer pair.
+# Question: {question}
+# # Answer:
+# # """
+    prompt_response = ChatPromptTemplate.from_template(ktemplate)
+    full_chain = (
+        RunnablePassthrough.assign(query=sql_chain).assign(
+            schema=get_schema,
+            response=lambda vars: run_query(vars["query"]),
+        )
+        | prompt_response
+        | KAIWA_llm
+    )
+
+    # response = full_chain.invoke({"question": query})
+    response = full_chain.invoke({
+        "question": query,
+    })
+
+    # print(f"DATA return: {json_data}")
+    print(f"File name: {csv_data_source}.csv")
+    response += f'\n\nSource file: {csv_data_source}.csv'
+    # response += f"\n\nDATA return: {json_data}"
+    response += f'\n\nJSONdata {json_data}'
+    torch.cuda.empty_cache()
+    torch.cuda.synchronize()
+    return response
+    # return response.split("Answer:\n    ")[1]
+
+def create_db():
+    # Define the folder path
+    folder_path = 'llama_server/csvdatafolder/'
+
+    # Define the database name
+    db_name = 'csvdb.db'
+
+   
+    # Create a connection to a SQLite database
+    conn = sqlite3.connect(folder_path+db_name)
+   
+    # List all files in the folder
+    files = os.listdir(folder_path)
+
+    # Filter out only CSV files
+    csv_files = [f for f in files if f.endswith('.csv')]
+
+    # Process each CSV file
+    for csv_file in csv_files:
+        # Full path of the CSV file
+        full_path = os.path.join(folder_path, csv_file)
+        
+        # Load the CSV data into a pandas DataFrame
+        df = pd.read_csv(full_path)
+        print(f"Data from ----{csv_file}:")
+        print(df.head())
+        
+        # Extract the base name of the file without the extension
+        base_name = os.path.splitext(os.path.basename(csv_file))[0]
+                
+        # Write the DataFrame to the SQLite database
+        df.to_sql(base_name, conn, if_exists='replace', index=False)
+
+    # Close the connection after processing all files
+    conn.close()
+    return None
+
+db = SQLDatabase.from_uri("sqlite:///csvdb.db")
+# db = SQLDatabase.from_uri("sqlite:////home/ubuntu/kaiwa/llama_server_testing/llama-server/llama_server/csvdatafolder/csvdb.db")
+csv_data_source = None
+def get_schema(sql_file_path):
+    """Extract the schema (DDL) from an SQLite database."""
+    conn = sqlite3.connect('/home/ubuntu/kaiwa/llama_server_testing/llama-server/llama_server/csvdatafolder/csvdb.db')
+    # conn = sqlite3.connect('/home/ubuntu/kaiwa/llama_server_testing/llama-server/csvdb.db')
+    cursor = conn.cursor()
+    cursor.execute("SELECT sql FROM sqlite_master WHERE type='table';")
+    schema = "\n".join([row[0] for row in cursor.fetchall()])
+    cursor.close()
+    conn.close()
+    return schema
+    
+
+def run_query(query):
+    global db, json_data, csv_data_source
+    json_data = None
+    csv_data_source = None
+    adjusted_sql_query = query
+    csv_data_source = extract_table_name(adjusted_sql_query)
+    adjusted_sql_query = adjusted_sql_query.replace("ILIKE", "LIKE")
+    adjusted_sql_query = adjusted_sql_query.replace("ilike", "like")
+    adjusted_sql_query = adjusted_sql_query.replace("TRUE", "1").replace("FALSE", "0")
+    adjusted_sql_query = adjusted_sql_query.replace("true", "1").replace("false", "0")
+    json_data = json.dumps(db._execute(adjusted_sql_query), default=str) 
+    print(f"json data ---- {json_data}")
+    return json_data
+    # return db.run(adjusted_sql_query)
+
+def extract_table_name(query):
+    # Regular expression to match the table name
+    print(f"extract table name queery ---- {query} ---end")
+    pattern = r'\bFROM\s+["]?(\w+)["]?\s+(\w+)?'
+    match = re.search(pattern, query, re.IGNORECASE)
+    
+    if match:
+        table_name = match.group(1)
+        return table_name
+    else:
+        return None
+#oooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooo
+sqlcoder_tokenizer = None
+sqlcoder_model = None
+json_data = None
+
+
+#get request banani hai fir uska endpoint banana hai / karke jo bhi naam dena dedo
+# # @app.get("/v1/json_data")
+# def get_json_data():
+#     global json_data
+#     if json_data:
+#         return json_data
+#     else:
+#         raise HTTPException(status_code=404, detail="json_data is not available.")
+
+
+# @app.get("/v1/models")
+# def models():
+#     return ModelList(data=[ModelInfo(id=model_id)])
+
+#-------------------------------------------------------------------------------------------------------------#
+#------------------------------llAMA2-------------------------------------------------------------------#
+#-------------------------------------------------------------------------------------------------------------#
+def llama(query):#
+    global dbqa
+    if dbqa == None:
+        dbqa = setup_dbqa()
+    response = dbqa({'query': query})
+    # answer = response["result"].strip("Answer: ")[1]
+    source_docs = response['source_documents']
+    output_list = response["result"]
+    # output_list = output_list.split("Answer:")
+    for i, doc in enumerate(source_docs):
+        output_list += f'<h2>'
+        # print(f'\nSource Document {i+1}\n')
+        # print(f'Source Text: {doc.page_content}')
+        output_list += f'\n\nSource Text: {doc.page_content}'   
+        # try:
+        #     output_list += f'\n\nDocument Name: {doc.metadata["source"]}'
+        #     output_list += f'\n\nPage Number: {doc.metadata["page"]}'
+        #     # print(f'Document Name: {doc.metadata["source"]}')
+        #     # print(f'Page Number: {doc.metadata["page"]}\n')
+        # except:
+        #     # image_url = 'https://storage.googleapis.com/image_store_kaiwa/Dog_and_woman_on_beach.jpg'
+        #     # response = requests.get(image_url)
+        #     # print(response) 
+        #     # output_list += f'\n\n img://"{image_url}"'
+        #     # output_list += f'\n\n"Image url: {image_url}"'
+        #     pass
+
+    formatted_response = re.sub(r'<.*?>', '', output_list)
+    further_suggestions = more_suggestions(formatted_response)
+
+    # suggestions = find_similar_questions(query, suggestion_csv_path,threshold=0.1)
+    # if suggestions:
+    #     formatted_response += '\n\nSuggestions:\n\n'
+    #     for suggestion in suggestions:
+    #         formatted_response += f'{suggestion}\n'
+    
+    #formatted_response += f'\n\nSuggestions:\n\n{suggestion}'
+
+    formatted_response += f'\n\nSuggestions:\n\n{further_suggestions}'
+    return formatted_response
+
+import time
+
+def more_suggestions(query):
+    start_time = time.time()
+    
+    KAIWA_llm = build_llm()
+    suggest_template = """You will be given a text and your task is to create suggestive questions based on the text only and nothing else. Below is the text:
+
+
+{question}
+
+
+Please provide two suggestive questions below:
+"""
+    suggest_response = ChatPromptTemplate.from_template(suggest_template)
+    suggest_chain =(
+        suggest_response
+        | KAIWA_llm
+        | StrOutputParser()
+    )
+    response = suggest_chain.invoke({"question": query})
+    end_time = time.time()
+    execution_time = end_time - start_time
+    print(f"Time taken to execute the function: {execution_time} seconds")
+    
+    return response
+
+
+#utils.py
+def build_retrieval_qa(llm, prompt, vectordb):
+    dbqa = RetrievalQA.from_chain_type(llm=llm,
+                                       chain_type='stuff',
+                                       retriever=vectordb.as_retriever(search_kwargs={'k': 1}),
+                                       return_source_documents=True,
+				                        verbose = False,
+                                        chain_type_kwargs={
+                                        'verbose':False,
+					                    'prompt':prompt,
+                                        'memory':ConversationBufferMemory(
+                                        #  memory_key = "history",
+                                         input_key = "question"),
+					 }
+                                       )
+    return dbqa
+
+
+def setup_dbqa():
+    embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2",
+                                       model_kwargs={'device': device})
+    vectordb = FAISS.load_local('llama_server/vectorstore/db_faiss', embeddings, allow_dangerous_deserialization=True)
+    # vectordb = FAISS.load_local('llama_server/vectorstore/db_faiss', embeddings)
+    llm = build_llm()
+    qa_prompt = set_qa_prompt()
+    dbqa = build_retrieval_qa(llm, qa_prompt, vectordb)
+    global sqlcoder_tokenizer, sqlcoder_model
+    model_name = "defog/sqlcoder-7b-2"
+    # if you have atleast 15GB of GPU memory, run load the model in float16
+    if sqlcoder_model == None:
+        sqlcoder_tokenizer = AutoTokenizer.from_pretrained(model_name)
+        sqlcoder_model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            trust_remote_code=True,
+            load_in_4bit=True,
+            device_map="auto",
+            use_cache=True,
+        )
+    return dbqa
+
+def set_qa_prompt():
+    """
+    Prompt template for QA retrieval for each vectorstore
+    """
+    prompt = PromptTemplate(template=qa_template,
+                            input_variables=['context', 'question'])
+    return prompt
+
+#################################################################################################################################
+#######             ORIGINAL TEMPLATE. REMOVE COMMENT IF NEED           #########################################################
+#################################################################################################################################
+# qa_template ="""Start the interaction with the user by asking some information regarding the user.
+# Use the following pieces of information to answer the user's each and every question.
+# If you don't know the answer, just politely say that you don't know.
+# The context is (delimited by <ctx></ctx>) and the chat history (delimited by <hs></hs>) to answer the question:
+# ------
+# <ctx>
+# {context}
+# </ctx>
+# <hs>
+# {history}
+# </hs>
+# ------
+# {question}
+# Always return helpful answer.
+# Answer:
+# """
+qa_template ="""
+<<SYS>>
+Start the interaction with the user by asking some information regarding the user.
+If you cannot answer the question from the given documents, please state that you do not have an answer.
+Use the following pieces of information to answer the user's question.
+<</SYS>>
+[INST] 
+{context}
+User: {question}
+[\INST] \n
+
+Answer:
+"""
+
+#llm.py
+def load_model(model_id, hf_auth):
+    # device = f'cuda:{cuda.current_device()}' if cuda.is_available() else 'cpu'
+
+    # set quantization configuration to load large model with less GPU memory
+    # this requires the `bitsandbytes` library
+    bnb_config = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_use_double_quant=False,
+        bnb_4bit_compute_dtype="float16" 
+    )
+    # begin initializing HF items, need auth token for these
+    model_config = AutoConfig.from_pretrained(
+        model_id,
+        use_auth_token=hf_auth
+    )
+
+    model = AutoModelForCausalLM.from_pretrained(
+        model_id,
+        trust_remote_code=True,
+        config=model_config,
+        quantization_config=bnb_config,
+        device_map='auto',
+        use_auth_token=hf_auth
+    )
+    return model
+##############################################################################################
+def load_tokenizer(model_id, hf_auth):
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_id,
+        use_auth_token=hf_auth
+    )
+    return tokenizer
+################################################################################################
+def gen_text():
+    generate_text = pipeline(
+        # model=load_model('meta-llama/Llama-2-7b-chat-hf','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'), 
+	    # tokenizer=load_tokenizer('meta-llama/Llama-2-7b-chat-hf', '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'),
+        model=load_model('mistralai/Mistral-7B-Instruct-v0.3','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'), 
+	    tokenizer=load_tokenizer('mistralai/Mistral-7B-Instruct-v0.3','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'),
+        return_full_text=False,  # langchain expects the full text
+        task='text-generation',
+        temperature=0.1,  # 'randomness' of outputs, 0.0 is the min and 1.0 the max
+        max_new_tokens=2000,  # mex number of tokens to generate in the output
+        repetition_penalty=1.1  # without this output begins repeating
+    )
+    return generate_text
+##################################################################################################
+llm = None
+def build_llm():
+    global llm
+    if llm == None:
+        llm = HuggingFacePipeline(pipeline=gen_text())
+    return llm
+#####################################################################################
+#######			RAG CODE ENDS				#####################
+#####################################################################################
+
+def chat_stream(
+    user_utt: str, temperature: float
+) -> Generator[Dict[str, Any], None, None]:
+    for text in _chat(user_utt, temperature):
+        logger.debug("text: %s", text)
+        payload = Completion(
+            choices=[Choice(delta=Message(role="assistant", content=text))]
+        )
+        yield {"event": "event", "data": payload.json()}
+    payload = Completion(choices=[Choice(finish_reason="stop")])
+    yield {"event": "event", "data": payload.json()}
+
+
+def chat_nonstream(user_utt: str, temperature: float) -> Completion:
+    assistant_utt = "".join(_chat(user_utt, temperature))
+    logger.info("assistant: %s", assistant_utt)
+    return Completion(
+        choices=[Choice(message=Message(role="assistant", content=assistant_utt))]
+    )
+
+
+@app.post("/v1/chat/completions")
+def chat(conv: Conversation):
+    user_utt = conv.messages[-1].content
+    temperature = conv.temperature
+    logger.info("user: %s temperature: %f", user_utt, temperature)
+    if not conv.stream:
+        return chat_nonstream(user_utt, temperature)
+    else:
+        return EventSourceResponse(
+            chat_stream(user_utt, temperature), ping_message_factory=None
+        )
+
+# More suggestion API
+@app.post("/v1/chat/more_sugg")
+def chat(conv: Conversation):
+    
+    user_utt = conv.messages[-1].content
+    temperature = conv.temperature
+    logger.info("user: %s temperature: %f", user_utt, temperature)
+    if not conv.stream:
+        return chat_nonstream(user_utt, temperature)
+    else:
+        return EventSourceResponse(
+            chat_stream(user_utt, temperature), ping_message_factory=None
+        )
+
+# prompt from frontend for summariser
+class NamesModel(BaseModel):
+    names: list[str]
+
+@app.post("/uiprompt")
+async def receive_names(data: NamesModel):
+    # Print the received data
+    print("Received data:", data.names)
+    return {"message": "Data received"}
+# store this to to some variable and use the value in prompt
+
+@app.get("/v1/models")
+def models():
+    return ModelList(data=[ModelInfo(id="llm")])
+    # return ModelList(data=[ModelInfo(id=model_id)])
+
+# get model from frontend
+class SelectedModel(BaseModel):
+    id: str
+
+received_model_id = None
+@app.post("/v1/selectedModels")
+async def selected_models(selected_model: SelectedModel):
+    global received_model_id
+    received_model_id = selected_model.id
+    # Process the received model ID as needed
+    print(selected_model)
+    return {"message": f"Received model ID: {received_model_id}"}
+
+
+class ModelPath(BaseModel):
+    name: str
+    path: str
+
+
+class KnownModels(BaseModel):
+    model_home: str
+    models: Dict[str, ModelPath]
+
+
+@click.command(context_settings={"show_default": True})
+@click.option(
+    "--models-yml",
+    type=click.Path(exists=True),
+    required=True,
+    help="Path to the `models.yml` file.",
+)
+@click.option("--host", type=click.STRING, default="0.0.0.0", help="Server host.")
+@click.option("--port", type=click.INT, default=8000, help="Server port.")
+@click.option(
+    "--reload",
+    is_flag=True,
+    default=False,
+    help="Reload server automatically (for development).",
+)
+@click.option("--model-id", type=click.STRING, default="llama-7b", help="Model id.")
+@click.option("--model-path", type=click.Path(exists=True), help="Model path.")
+@click.option(
+    "--log-level",
+    type=click.Choice(["INFO", "DEBUG", "WARNING", "ERROR", "CRITICAL"]),
+    default="INFO",
+    help="Log level.",
+)
+def main(
+    models_yml: Path,
+    host: str,
+    port: int,
+    reload: bool,
+    model_id: Optional[str] = None,
+    model_path: Optional[Path] = None,
+    log_level: Optional[str] = None,
+):
+
+    global dbqa
+    dbqa = setup_dbqa()
+    create_db()
+    print("....///......."*10)
+
+    # with open(models_yml, "r", encoding="utf-8") as f:
+    #     data = yaml.safe_load(f)
+    # KNOWN_MODELS = KnownModels.parse_obj(data)
+    # if model_id is None:
+    #     model_id = os.environ.get("LLAMA_MODEL_ID", "llama-7b")
+    #     assert model_id in KNOWN_MODELS.models, f"Unknown model id: {model_id}"
+    # if model_path is None:
+    #     model_path = Path(KNOWN_MODELS.models.get(model_id).path)
+    #     if not model_path.is_absolute():
+    #         model_path = Path(KNOWN_MODELS.model_home) / model_path
+    # globals()["model_id"] = model_id
+    # globals()["model"] = Model(
+    #     model_path=str(model_path),
+    #     n_ctx=1024,
+    # #     # prompt_context=PROMPT,
+    # #     #prompt_prefix=REVERSE_PROMPT,
+    # #     #prompt_suffix=REPLY_PREFIX,
+    # )
+    globals()["logger"] = logging.getLogger(name=__name__)
+    globals()["logger"].setLevel(log_level)
+
+    uvicorn.run("llama_server.server:app", host=host, port=port, reload=reload)
+
+
+if __name__ == "__main__":
+    main()
